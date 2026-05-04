@@ -3,6 +3,7 @@ import sys
 import asyncio
 import time
 import threading
+import functools
 import requests
 import feedparser
 import logging
@@ -30,6 +31,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 MONGO_URI = os.getenv("MONGO_URI")
 APP_URL = os.getenv("APP_URL")  # Used for keep-alive
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # Telegram user ID of the bot owner
 
 # Setup Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -44,6 +46,9 @@ if not MONGO_URI:
 if not CHANNEL_ID:
     logging.error("Missing CHANNEL_ID. Set it in your environment or .env file.")
     sys.exit(1)
+if not OWNER_ID:
+    logging.error("Missing OWNER_ID. Set it in your environment or .env file.")
+    sys.exit(1)
 
 # MongoDB Setup
 client = MongoClient(MONGO_URI)
@@ -56,6 +61,21 @@ MAX_SEEN_PER_FEED = 100
 
 # ConversationHandler states
 SELECT_FEED, SELECT_POST = range(2)
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+def owner_only(func):
+    """Decorator: silently ignore commands from anyone who isn't OWNER_ID."""
+    @functools.wraps(func)
+    async def wrapper(update: Update, context, *args, **kwargs):
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id != OWNER_ID:
+            logging.warning(f"Blocked unauthorized access from user_id={user_id}")
+            return  # silent reject — no message to the stranger
+        return await func(update, context, *args, **kwargs)
+    return wrapper
 
 # Flask for Render Web Service
 app = Flask(__name__)
@@ -172,6 +192,7 @@ async def fetch_and_post_loop(application: Application):
 # /fetchpost — interactive manual post picker
 # ---------------------------------------------------------------------------
 
+@owner_only
 async def fetchpost_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Step 1: show all registered feeds as inline buttons."""
     feeds = list(feeds_collection.find())
@@ -280,6 +301,7 @@ async def fetchpost_select_post(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
+@owner_only
 async def fetchpost_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
@@ -288,6 +310,7 @@ async def fetchpost_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # Other commands
 # ---------------------------------------------------------------------------
 
+@owner_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 <b>Movie News Bot is Active!</b>\n\n"
@@ -300,6 +323,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML',
     )
 
+@owner_only
 async def add_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         return await update.message.reply_text("Usage: /addfeed <url>")
@@ -310,6 +334,7 @@ async def add_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ Feed already exists.")
 
+@owner_only
 async def list_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     feeds = list(feeds_collection.find())
     if not feeds:
@@ -317,6 +342,7 @@ async def list_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"{i+1}. <code>{f['url']}</code>" for i, f in enumerate(feeds)]
     await update.message.reply_text("📋 <b>Registered feeds:</b>\n\n" + "\n".join(lines), parse_mode='HTML')
 
+@owner_only
 async def remove_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         return await update.message.reply_text("Usage: /removefeed <url>")
@@ -327,6 +353,7 @@ async def remove_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ Feed not found.")
 
+@owner_only
 async def seed_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mark the latest entries from every feed as seen WITHOUT posting.
     Run this once on a fresh DB to avoid re-posting existing channel articles."""
