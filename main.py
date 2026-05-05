@@ -59,7 +59,7 @@ feed_state_collection = db['feed_state']   # one doc per feed, rolling seen_link
 feeds_collection = db['rss_feeds']
 
 # Max number of link URLs retained per feed document (rolling window)
-MAX_SEEN_PER_FEED = 100
+MAX_SEEN_PER_FEED = 5
 
 # Rate-limit handling
 POST_DELAY_SECONDS = 2.0
@@ -131,25 +131,14 @@ def get_entry_timestamp(entry) -> int | None:
     except Exception:
         return None
 
-def is_new_entry(feed_url: str, entry, last_pub_ts: int) -> bool:
+def is_new_entry(feed_url: str, entry, last_pub_ts: int, now_ts: int | None = None) -> bool:
     """Return True if entry is newer than last_pub_ts (fallback to seen_links)."""
     entry_ts = get_entry_timestamp(entry)
     if entry_ts is not None:
+        if now_ts is not None and entry_ts > now_ts:
+            return False
         return entry_ts > last_pub_ts
     return not is_seen(feed_url, entry.link)
-
-def dedupe_seen_links(links: list[str]) -> list[str]:
-    """De-dupe while keeping the latest occurrence and limiting to MAX_SEEN_PER_FEED."""
-    seen = set()
-    deduped_rev = []
-    for link in reversed(links):
-        if link not in seen:
-            seen.add(link)
-            deduped_rev.append(link)
-    deduped = list(reversed(deduped_rev))
-    if len(deduped) > MAX_SEEN_PER_FEED:
-        deduped = deduped[-MAX_SEEN_PER_FEED:]
-    return deduped
 
 def is_seen(feed_url: str, link: str) -> bool:
     """True if link was already seen/posted for this feed."""
@@ -258,10 +247,26 @@ async def fetch_and_post(bot: Bot):
         feed_url = f['url']
         feed = feedparser.parse(feed_url)
         last_pub_ts = get_last_pub_ts(feed_url)
+        now_ts = int(time.time())
+
+        # Bootstrap: after a feed_state reset, seed last_pub_ts and keep only a few links.
+        if last_pub_ts == 0:
+            max_ts = None
+            for entry in feed.entries:
+                entry_ts = get_entry_timestamp(entry)
+                if entry_ts is None or entry_ts > now_ts:
+                    continue
+                if max_ts is None or entry_ts > max_ts:
+                    max_ts = entry_ts
+            if max_ts is not None:
+                set_last_pub_ts(feed_url, max_ts)
+            for entry in feed.entries[:MAX_SEEN_PER_FEED]:
+                mark_seen(feed_url, entry.link)
+            continue
 
         new_entries = [
             entry for entry in feed.entries
-            if is_new_entry(feed_url, entry, last_pub_ts)
+            if is_new_entry(feed_url, entry, last_pub_ts, now_ts)
         ]
         if not new_entries:
             continue
@@ -345,10 +350,11 @@ async def fetchpost_select_feed(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data['fetchpost_feed_url'] = feed_url
 
     last_pub_ts = get_last_pub_ts(feed_url)
+    now_ts = int(time.time())
     keyboard = []
     for i, entry in enumerate(entries):
         title = entry.title[:55] + ("…" if len(entry.title) > 55 else "")
-        prefix = "🆕" if is_new_entry(feed_url, entry, last_pub_ts) else "✅"
+        prefix = "🆕" if is_new_entry(feed_url, entry, last_pub_ts, now_ts) else "✅"
         keyboard.append([InlineKeyboardButton(f"{prefix} {title}", callback_data=f"post:{i}")])
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back")])
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
@@ -431,7 +437,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "• /fetchpost — manually pick &amp; publish a post\n"
         "• /seedfeeds — mark current feed entries as seen (no post) — run on fresh DB\n"
-        "• /migratefeedstate — one-time dedupe + backfill pubDate state\n"
         "• /addfeed &lt;url&gt; — add an RSS feed\n"
         "• /listfeeds — list registered feeds\n"
         "• /removefeed &lt;url&gt; — remove a feed",
@@ -485,11 +490,16 @@ async def seed_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         feed_url = f['url']
         parsed = feedparser.parse(feed_url)
         max_ts = None
+        fallback_count = 0
+        now_ts = int(time.time())
         for entry in parsed.entries:
             entry_ts = get_entry_timestamp(entry)
             if entry_ts is not None:
-                if max_ts is None or entry_ts > max_ts:
+                if entry_ts <= now_ts and (max_ts is None or entry_ts > max_ts):
                     max_ts = entry_ts
+                continue
+
+            if fallback_count >= MAX_SEEN_PER_FEED:
                 continue
 
             if not is_seen(feed_url, entry.link):
@@ -497,6 +507,7 @@ async def seed_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 total_new += 1
             else:
                 total_skip += 1
+            fallback_count += 1
 
         if max_ts is not None:
             set_last_pub_ts(feed_url, max_ts)
@@ -511,50 +522,6 @@ async def seed_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML',
     )
 
-@owner_only
-async def migrate_feed_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """One-time migration: dedupe seen_links and backfill last_pub_ts."""
-    feeds = list(feeds_collection.find())
-    if not feeds:
-        return await update.message.reply_text("⚠️ No feeds registered yet.")
-
-    status_msg = await update.message.reply_text("⏳ Migrating feed state…")
-
-    deduped_docs = 0
-    for doc in feed_state_collection.find({}, {"seen_links": 1}):
-        seen_links = doc.get("seen_links", [])
-        deduped = dedupe_seen_links(seen_links)
-        if deduped != seen_links:
-            feed_state_collection.update_one(
-                {"_id": doc["_id"]},
-                {"$set": {"seen_links": deduped}},
-            )
-            deduped_docs += 1
-
-    ts_set = 0
-    ts_missing = 0
-    for f in feeds:
-        feed_url = f['url']
-        parsed = feedparser.parse(feed_url)
-        max_ts = None
-        for entry in parsed.entries:
-            entry_ts = get_entry_timestamp(entry)
-            if entry_ts is not None:
-                if max_ts is None or entry_ts > max_ts:
-                    max_ts = entry_ts
-        if max_ts is not None:
-            set_last_pub_ts(feed_url, max_ts)
-            ts_set += 1
-        else:
-            ts_missing += 1
-
-    await status_msg.edit_text(
-        f"✅ <b>Migration complete!</b>\n\n"
-        f"• <b>{deduped_docs}</b> feed_state docs deduped\n"
-        f"• <b>{ts_set}</b> feeds stored last_pub_ts\n"
-        f"• <b>{ts_missing}</b> feeds missing pubDate\n",
-        parse_mode='HTML',
-    )
 
 # ---------------------------------------------------------------------------
 # Flask + scheduler helpers
@@ -616,6 +583,5 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("listfeeds", list_feeds))
     application.add_handler(CommandHandler("removefeed", remove_feed))
     application.add_handler(CommandHandler("seedfeeds", seed_feeds))
-    application.add_handler(CommandHandler("migratefeedstate", migrate_feed_state))
 
     application.run_polling()
