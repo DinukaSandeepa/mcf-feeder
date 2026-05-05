@@ -202,10 +202,12 @@ def build_post_caption(entry) -> tuple[str, str | None]:
     if description:
         description += "..."
 
+    import html
+    
     # Title as headline — always at the very top so it's visible before "Show more"
-    title_line = f"📰 <b>{entry.title}</b>"
+    title_line = f"📰 <b>{html.escape(entry.title)}</b>"
     divider = "─" * 20
-    body = description if description else ""
+    body = html.escape(description) if description else ""
     link_line = f'🔗 <a href="{entry.link}">Read Full Article</a>'
 
     parts = [title_line, divider]
@@ -537,12 +539,11 @@ def run_flask():
 async def post_init(application: Application) -> None:
     """Called by PTB after the app is initialised, inside the running event loop."""
     job_queue = application.job_queue
-    # Use a longer first-run delay so the operator has time to /seedfeeds
-    # if the DB is empty and the channel already has existing posts.
-    first_run_delay = 300
+    # Use a short first-run delay to start checking feeds almost immediately on startup
+    first_run_delay = 10
     if job_queue:
         job_queue.run_repeating(fetch_and_post_job, interval=300, first=first_run_delay)
-        logging.info("Scheduled fetch_and_post via JobQueue every 5 minutes (first run in 5 min).")
+        logging.info("Scheduled fetch_and_post via JobQueue every 5 minutes (first run in 10s).")
     else:
         logging.warning("JobQueue not available. Using manual asyncio loop.")
         asyncio.get_event_loop().create_task(fetch_and_post_loop(application))
