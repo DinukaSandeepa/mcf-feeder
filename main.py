@@ -11,6 +11,7 @@ import logging
 from flask import Flask
 from pymongo import MongoClient
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter, Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -59,6 +60,10 @@ feeds_collection = db['rss_feeds']
 
 # Max number of link URLs retained per feed document (rolling window)
 MAX_SEEN_PER_FEED = 100
+
+# Rate-limit handling
+POST_DELAY_SECONDS = 2.0
+MAX_SEND_RETRIES = 3
 
 # ConversationHandler states
 SELECT_FEED, SELECT_POST = range(2)
@@ -185,6 +190,20 @@ def mark_seen(feed_url: str, link: str) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+async def send_with_retry(send_func, *args, **kwargs):
+    """Send a Telegram message with basic RetryAfter backoff."""
+    attempts = 0
+    while True:
+        try:
+            return await send_func(*args, **kwargs)
+        except RetryAfter as exc:
+            attempts += 1
+            wait_seconds = int(getattr(exc, "retry_after", 1)) + 1
+            logging.warning("Rate limited by Telegram. Retrying in %s seconds.", wait_seconds)
+            if attempts >= MAX_SEND_RETRIES:
+                raise
+            await asyncio.sleep(wait_seconds)
+
 def build_post_caption(entry) -> tuple[str, str | None]:
     """Return (caption_html, photo_url | None) for a feed entry."""
     soup = BeautifulSoup(getattr(entry, 'summary', ''), 'html.parser')
@@ -212,9 +231,20 @@ async def publish_entry(bot: Bot, feed_url: str, entry) -> None:
     """Post a feed entry to the channel and update the feed's seen_links."""
     caption, photo_url = build_post_caption(entry)
     if photo_url:
-        await bot.send_photo(chat_id=CHANNEL_ID, photo=photo_url, caption=caption, parse_mode='HTML')
+        await send_with_retry(
+            bot.send_photo,
+            chat_id=CHANNEL_ID,
+            photo=photo_url,
+            caption=caption,
+            parse_mode='HTML',
+        )
     else:
-        await bot.send_message(chat_id=CHANNEL_ID, text=caption, parse_mode='HTML')
+        await send_with_retry(
+            bot.send_message,
+            chat_id=CHANNEL_ID,
+            text=caption,
+            parse_mode='HTML',
+        )
     mark_seen(feed_url, entry.link)   # update in-place, no new document
     logging.info(f"Posted: {entry.title}")
 
@@ -237,7 +267,7 @@ async def fetch_and_post(bot: Bot):
             continue
 
         # Post oldest-to-newest to preserve timeline order.
-        for entry in reversed(new_entries):
+        for index, entry in enumerate(reversed(new_entries)):
             try:
                 await publish_entry(bot, feed_url, entry)
                 entry_ts = get_entry_timestamp(entry)
@@ -248,6 +278,8 @@ async def fetch_and_post(bot: Bot):
                 # Avoid skipping timestamped entries on failure.
                 if get_entry_timestamp(entry) is not None:
                     break
+            if index < len(new_entries) - 1:
+                await asyncio.sleep(POST_DELAY_SECONDS)
 
 async def fetch_and_post_job(context: ContextTypes.DEFAULT_TYPE):
     await fetch_and_post(context.bot)
@@ -375,6 +407,18 @@ async def fetchpost_select_post(update: Update, context: ContextTypes.DEFAULT_TY
 async def fetchpost_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log Telegram API errors and stop on polling conflicts."""
+    err = context.error
+    if isinstance(err, Conflict):
+        logging.error("Polling conflict: another instance is running. Stopping bot.")
+        try:
+            await context.application.stop()
+        except Exception:
+            logging.exception("Failed to stop application after conflict.")
+        return
+    logging.error("Unhandled error: %s", err)
 
 # ---------------------------------------------------------------------------
 # Other commands
@@ -566,6 +610,7 @@ if __name__ == "__main__":
     )
 
     application.add_handler(fetchpost_handler)
+    application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("addfeed", add_feed))
     application.add_handler(CommandHandler("listfeeds", list_feeds))
