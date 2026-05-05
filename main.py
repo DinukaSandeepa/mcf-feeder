@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 import time
+import calendar
 import threading
 import functools
 import requests
@@ -102,6 +103,49 @@ def _get_state(feed_url: str) -> list[str]:
     doc = feed_state_collection.find_one({"feed_url": feed_url}, {"seen_links": 1})
     return doc["seen_links"] if doc else []
 
+def get_last_pub_ts(feed_url: str) -> int:
+    """Return the last published timestamp (epoch seconds) for a feed."""
+    doc = feed_state_collection.find_one({"feed_url": feed_url}, {"last_pub_ts": 1})
+    return int(doc.get("last_pub_ts", 0)) if doc else 0
+
+def set_last_pub_ts(feed_url: str, ts: int) -> None:
+    """Persist the last published timestamp for a feed."""
+    feed_state_collection.update_one(
+        {"feed_url": feed_url},
+        {"$set": {"last_pub_ts": int(ts)}},
+        upsert=True,
+    )
+
+def get_entry_timestamp(entry) -> int | None:
+    """Return the entry's timestamp (epoch seconds) or None if missing."""
+    parsed = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    if not parsed:
+        return None
+    try:
+        return int(calendar.timegm(parsed))
+    except Exception:
+        return None
+
+def is_new_entry(feed_url: str, entry, last_pub_ts: int) -> bool:
+    """Return True if entry is newer than last_pub_ts (fallback to seen_links)."""
+    entry_ts = get_entry_timestamp(entry)
+    if entry_ts is not None:
+        return entry_ts > last_pub_ts
+    return not is_seen(feed_url, entry.link)
+
+def dedupe_seen_links(links: list[str]) -> list[str]:
+    """De-dupe while keeping the latest occurrence and limiting to MAX_SEEN_PER_FEED."""
+    seen = set()
+    deduped_rev = []
+    for link in reversed(links):
+        if link not in seen:
+            seen.add(link)
+            deduped_rev.append(link)
+    deduped = list(reversed(deduped_rev))
+    if len(deduped) > MAX_SEEN_PER_FEED:
+        deduped = deduped[-MAX_SEEN_PER_FEED:]
+    return deduped
+
 def is_seen(feed_url: str, link: str) -> bool:
     """True if link was already seen/posted for this feed."""
     doc = feed_state_collection.find_one(
@@ -116,14 +160,24 @@ def mark_seen(feed_url: str, link: str) -> None:
     """
     feed_state_collection.update_one(
         {"feed_url": feed_url},
-        {
-            "$push": {
-                "seen_links": {
-                    "$each": [link],
-                    "$slice": -MAX_SEEN_PER_FEED,   # keep only the latest N
+        [
+            {
+                "$set": {
+                    "feed_url": feed_url,
+                    "seen_links": {
+                        "$slice": [
+                            {
+                                "$setUnion": [
+                                    {"$ifNull": ["$seen_links", []]},
+                                    [link],
+                                ]
+                            },
+                            -MAX_SEEN_PER_FEED,
+                        ]
+                    },
                 }
             }
-        },
+        ],
         upsert=True,
     )
 
@@ -173,12 +227,27 @@ async def fetch_and_post(bot: Bot):
     for f in feeds:
         feed_url = f['url']
         feed = feedparser.parse(feed_url)
-        for entry in feed.entries[:3]:
-            if not is_seen(feed_url, entry.link):
-                try:
-                    await publish_entry(bot, feed_url, entry)
-                except Exception as e:
-                    logging.error(f"Error posting: {e}")
+        last_pub_ts = get_last_pub_ts(feed_url)
+
+        new_entries = [
+            entry for entry in feed.entries
+            if is_new_entry(feed_url, entry, last_pub_ts)
+        ]
+        if not new_entries:
+            continue
+
+        # Post oldest-to-newest to preserve timeline order.
+        for entry in reversed(new_entries):
+            try:
+                await publish_entry(bot, feed_url, entry)
+                entry_ts = get_entry_timestamp(entry)
+                if entry_ts is not None:
+                    set_last_pub_ts(feed_url, entry_ts)
+            except Exception as e:
+                logging.error(f"Error posting: {e}")
+                # Avoid skipping timestamped entries on failure.
+                if get_entry_timestamp(entry) is not None:
+                    break
 
 async def fetch_and_post_job(context: ContextTypes.DEFAULT_TYPE):
     await fetch_and_post(context.bot)
@@ -243,10 +312,11 @@ async def fetchpost_select_feed(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data['fetchpost_entries'] = entries
     context.user_data['fetchpost_feed_url'] = feed_url
 
+    last_pub_ts = get_last_pub_ts(feed_url)
     keyboard = []
     for i, entry in enumerate(entries):
         title = entry.title[:55] + ("…" if len(entry.title) > 55 else "")
-        prefix = "✅" if is_seen(feed_url, entry.link) else "🆕"
+        prefix = "🆕" if is_new_entry(feed_url, entry, last_pub_ts) else "✅"
         keyboard.append([InlineKeyboardButton(f"{prefix} {title}", callback_data=f"post:{i}")])
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back")])
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
@@ -317,6 +387,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "• /fetchpost — manually pick &amp; publish a post\n"
         "• /seedfeeds — mark current feed entries as seen (no post) — run on fresh DB\n"
+        "• /migratefeedstate — one-time dedupe + backfill pubDate state\n"
         "• /addfeed &lt;url&gt; — add an RSS feed\n"
         "• /listfeeds — list registered feeds\n"
         "• /removefeed &lt;url&gt; — remove a feed",
@@ -365,21 +436,79 @@ async def seed_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total_new = 0
     total_skip = 0
+    total_last_ts = 0
     for f in feeds:
         feed_url = f['url']
         parsed = feedparser.parse(feed_url)
-        for entry in parsed.entries[:10]:   # seed up to 10 latest per feed
+        max_ts = None
+        for entry in parsed.entries:
+            entry_ts = get_entry_timestamp(entry)
+            if entry_ts is not None:
+                if max_ts is None or entry_ts > max_ts:
+                    max_ts = entry_ts
+                continue
+
             if not is_seen(feed_url, entry.link):
                 mark_seen(feed_url, entry.link)  # update in-place, no new document
                 total_new += 1
             else:
                 total_skip += 1
 
+        if max_ts is not None:
+            set_last_pub_ts(feed_url, max_ts)
+            total_last_ts += 1
+
     await status_msg.edit_text(
         f"✅ <b>Seeding complete!</b>\n\n"
         f"• <b>{total_new}</b> entries marked as seen (will not be auto-posted)\n"
-        f"• <b>{total_skip}</b> already recorded\n\n"
+        f"• <b>{total_skip}</b> already recorded\n"
+        f"• <b>{total_last_ts}</b> feeds stored last_pub_ts\n\n"
         f"The auto-scheduler will now only post <i>new</i> articles.",
+        parse_mode='HTML',
+    )
+
+@owner_only
+async def migrate_feed_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """One-time migration: dedupe seen_links and backfill last_pub_ts."""
+    feeds = list(feeds_collection.find())
+    if not feeds:
+        return await update.message.reply_text("⚠️ No feeds registered yet.")
+
+    status_msg = await update.message.reply_text("⏳ Migrating feed state…")
+
+    deduped_docs = 0
+    for doc in feed_state_collection.find({}, {"seen_links": 1}):
+        seen_links = doc.get("seen_links", [])
+        deduped = dedupe_seen_links(seen_links)
+        if deduped != seen_links:
+            feed_state_collection.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"seen_links": deduped}},
+            )
+            deduped_docs += 1
+
+    ts_set = 0
+    ts_missing = 0
+    for f in feeds:
+        feed_url = f['url']
+        parsed = feedparser.parse(feed_url)
+        max_ts = None
+        for entry in parsed.entries:
+            entry_ts = get_entry_timestamp(entry)
+            if entry_ts is not None:
+                if max_ts is None or entry_ts > max_ts:
+                    max_ts = entry_ts
+        if max_ts is not None:
+            set_last_pub_ts(feed_url, max_ts)
+            ts_set += 1
+        else:
+            ts_missing += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>Migration complete!</b>\n\n"
+        f"• <b>{deduped_docs}</b> feed_state docs deduped\n"
+        f"• <b>{ts_set}</b> feeds stored last_pub_ts\n"
+        f"• <b>{ts_missing}</b> feeds missing pubDate\n",
         parse_mode='HTML',
     )
 
@@ -442,5 +571,6 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("listfeeds", list_feeds))
     application.add_handler(CommandHandler("removefeed", remove_feed))
     application.add_handler(CommandHandler("seedfeeds", seed_feeds))
+    application.add_handler(CommandHandler("migratefeedstate", migrate_feed_state))
 
     application.run_polling()
