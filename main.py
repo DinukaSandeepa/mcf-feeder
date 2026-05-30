@@ -68,6 +68,11 @@ MAX_SEND_RETRIES = 3
 # ConversationHandler states
 SELECT_FEED, SELECT_POST = range(2)
 
+# In-memory failure tracking to prevent getting permanently stuck on cursed entries
+FAIL_COUNTS = {}  # key: (feed_url, link), value: int
+MAX_FAIL_ATTEMPTS = 3
+
+
 # ---------------------------------------------------------------------------
 # Access control
 # ---------------------------------------------------------------------------
@@ -132,13 +137,15 @@ def get_entry_timestamp(entry) -> int | None:
         return None
 
 def is_new_entry(feed_url: str, entry, last_pub_ts: int, now_ts: int | None = None) -> bool:
-    """Return True if entry is newer than last_pub_ts (fallback to seen_links)."""
+    """Return True if entry is newer than last_pub_ts and has not been seen."""
+    if is_seen(feed_url, entry.link):
+        return False
     entry_ts = get_entry_timestamp(entry)
     if entry_ts is not None:
         if now_ts is not None and entry_ts > now_ts:
             return False
         return entry_ts > last_pub_ts
-    return not is_seen(feed_url, entry.link)
+    return True
 
 def is_seen(feed_url: str, link: str) -> bool:
     """True if link was already seen/posted for this feed."""
@@ -208,7 +215,7 @@ def build_post_caption(entry) -> tuple[str, str | None]:
     title_line = f"📰 <b>{html.escape(entry.title)}</b>"
     divider = "─" * 20
     body = html.escape(description) if description else ""
-    link_line = f'🔗 <a href="{entry.link}">Read Full Article</a>'
+    link_line = f'🔗 <a href="{html.escape(entry.link)}">Read Full Article</a>'
 
     parts = [title_line, divider]
     if body:
@@ -221,23 +228,51 @@ def build_post_caption(entry) -> tuple[str, str | None]:
 async def publish_entry(bot: Bot, feed_url: str, entry) -> None:
     """Post a feed entry to the channel and update the feed's seen_links."""
     caption, photo_url = build_post_caption(entry)
+    
+    # Tier 1: Try sending with photo (if available) and HTML caption
     if photo_url:
-        await send_with_retry(
-            bot.send_photo,
-            chat_id=CHANNEL_ID,
-            photo=photo_url,
-            caption=caption,
-            parse_mode='HTML',
-        )
-    else:
+        try:
+            await send_with_retry(
+                bot.send_photo,
+                chat_id=CHANNEL_ID,
+                photo=photo_url,
+                caption=caption,
+                parse_mode='HTML',
+            )
+            mark_seen(feed_url, entry.link)   # update in-place, no new document
+            logging.info(f"Posted photo: {entry.title}")
+            return
+        except Exception as exc:
+            logging.warning(f"Failed to send photo for '{entry.title}' ({exc}). Falling back to HTML text-only.")
+
+    # Tier 2: Try sending with HTML text-only (either because no photo, or photo failed)
+    try:
         await send_with_retry(
             bot.send_message,
             chat_id=CHANNEL_ID,
             text=caption,
             parse_mode='HTML',
         )
-    mark_seen(feed_url, entry.link)   # update in-place, no new document
-    logging.info(f"Posted: {entry.title}")
+        mark_seen(feed_url, entry.link)   # update in-place, no new document
+        logging.info(f"Posted HTML text: {entry.title}")
+        return
+    except Exception as exc:
+        logging.warning(f"Failed to send HTML text for '{entry.title}' ({exc}). Falling back to plain text.")
+
+    # Tier 3: Try sending as plain text (avoids strict Telegram HTML parse mode issues)
+    plain_text = f"📰 {entry.title}\n\n🔗 Read Full Article: {entry.link}"
+    try:
+        await send_with_retry(
+            bot.send_message,
+            chat_id=CHANNEL_ID,
+            text=plain_text,
+        )
+        mark_seen(feed_url, entry.link)   # update in-place, no new document
+        logging.info(f"Posted plain text: {entry.title}")
+        return
+    except Exception as exc:
+        logging.error(f"All posting attempts failed for '{entry.title}': {exc}")
+        raise
 
 # ---------------------------------------------------------------------------
 # Auto-fetch (scheduled job)
@@ -280,9 +315,26 @@ async def fetch_and_post(bot: Bot):
                 entry_ts = get_entry_timestamp(entry)
                 if entry_ts is not None:
                     set_last_pub_ts(feed_url, entry_ts)
+                # Clear failure count on successful post
+                FAIL_COUNTS.pop((feed_url, entry.link), None)
             except Exception as e:
-                logging.error(f"Error posting: {e}")
-                # Avoid skipping timestamped entries on failure.
+                logging.error(f"Error posting '{entry.title}': {e}")
+                
+                # Track and increment failure attempts for this entry
+                key = (feed_url, entry.link)
+                fail_count = FAIL_COUNTS.get(key, 0) + 1
+                FAIL_COUNTS[key] = fail_count
+                
+                if fail_count >= MAX_FAIL_ATTEMPTS:
+                    logging.error(f"Entry '{entry.title}' failed {fail_count} times. Skipping and marking as seen to unblock queue.")
+                    mark_seen(feed_url, entry.link)
+                    entry_ts = get_entry_timestamp(entry)
+                    if entry_ts is not None:
+                        set_last_pub_ts(feed_url, entry_ts)
+                    FAIL_COUNTS.pop(key, None)
+                    continue  # Do not break, proceed with next entries
+                
+                # Avoid skipping timestamped entries on failure (break so we can retry on next run).
                 if get_entry_timestamp(entry) is not None:
                     break
             if index < len(new_entries) - 1:
