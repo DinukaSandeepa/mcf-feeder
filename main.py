@@ -59,7 +59,7 @@ feed_state_collection = db['feed_state']   # one doc per feed, rolling seen_link
 feeds_collection = db['rss_feeds']
 
 # Max number of link URLs retained per feed document (rolling window)
-MAX_SEEN_PER_FEED = 5
+MAX_SEEN_PER_FEED = 50
 
 # Rate-limit handling
 POST_DELAY_SECONDS = 2.0
@@ -71,6 +71,11 @@ SELECT_FEED, SELECT_POST = range(2)
 # In-memory failure tracking to prevent getting permanently stuck on cursed entries
 FAIL_COUNTS = {}  # key: (feed_url, link), value: int
 MAX_FAIL_ATTEMPTS = 3
+
+
+def get_entry_link(entry) -> str | None:
+    """Safely return an entry's link URL, or None if missing."""
+    return getattr(entry, 'link', None) or None
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +143,10 @@ def get_entry_timestamp(entry) -> int | None:
 
 def is_new_entry(feed_url: str, entry, last_pub_ts: int, now_ts: int | None = None) -> bool:
     """Return True if entry is newer than last_pub_ts and has not been seen."""
-    if is_seen(feed_url, entry.link):
+    link = get_entry_link(entry)
+    if link is None:
+        return False  # skip entries without a link entirely
+    if is_seen(feed_url, link):
         return False
     entry_ts = get_entry_timestamp(entry)
     if entry_ts is not None:
@@ -211,22 +219,25 @@ def build_post_caption(entry) -> tuple[str, str | None]:
 
     import html
     
+    link = get_entry_link(entry) or ''
     # Title as headline — always at the very top so it's visible before "Show more"
     title_line = f"📰 <b>{html.escape(entry.title)}</b>"
     divider = "─" * 20
     body = html.escape(description) if description else ""
-    link_line = f'🔗 <a href="{html.escape(entry.link)}">Read Full Article</a>'
+    link_line = f'🔗 <a href="{html.escape(link)}">Read Full Article</a>' if link else ''
 
     parts = [title_line, divider]
     if body:
         parts.append(body)
-    parts.append(link_line)
+    if link_line:
+        parts.append(link_line)
 
     caption = "\n\n".join(parts)
     return caption, photo_url
 
 async def publish_entry(bot: Bot, feed_url: str, entry) -> None:
     """Post a feed entry to the channel and update the feed's seen_links."""
+    link = get_entry_link(entry)
     caption, photo_url = build_post_caption(entry)
     
     # Tier 1: Try sending with photo (if available) and HTML caption
@@ -239,7 +250,8 @@ async def publish_entry(bot: Bot, feed_url: str, entry) -> None:
                 caption=caption,
                 parse_mode='HTML',
             )
-            mark_seen(feed_url, entry.link)   # update in-place, no new document
+            if link:
+                mark_seen(feed_url, link)
             logging.info(f"Posted photo: {entry.title}")
             return
         except Exception as exc:
@@ -253,21 +265,24 @@ async def publish_entry(bot: Bot, feed_url: str, entry) -> None:
             text=caption,
             parse_mode='HTML',
         )
-        mark_seen(feed_url, entry.link)   # update in-place, no new document
+        if link:
+            mark_seen(feed_url, link)
         logging.info(f"Posted HTML text: {entry.title}")
         return
     except Exception as exc:
         logging.warning(f"Failed to send HTML text for '{entry.title}' ({exc}). Falling back to plain text.")
 
     # Tier 3: Try sending as plain text (avoids strict Telegram HTML parse mode issues)
-    plain_text = f"📰 {entry.title}\n\n🔗 Read Full Article: {entry.link}"
+    link_text = link or '(no link)'
+    plain_text = f"📰 {entry.title}\n\n🔗 Read Full Article: {link_text}"
     try:
         await send_with_retry(
             bot.send_message,
             chat_id=CHANNEL_ID,
             text=plain_text,
         )
-        mark_seen(feed_url, entry.link)   # update in-place, no new document
+        if link:
+            mark_seen(feed_url, link)
         logging.info(f"Posted plain text: {entry.title}")
         return
     except Exception as exc:
@@ -298,7 +313,9 @@ async def fetch_and_post(bot: Bot):
             if max_ts is not None:
                 set_last_pub_ts(feed_url, max_ts)
             for entry in feed.entries[:MAX_SEEN_PER_FEED]:
-                mark_seen(feed_url, entry.link)
+                link = get_entry_link(entry)
+                if link:
+                    mark_seen(feed_url, link)
             continue
 
         new_entries = [
@@ -310,24 +327,29 @@ async def fetch_and_post(bot: Bot):
 
         # Post oldest-to-newest to preserve timeline order.
         for index, entry in enumerate(reversed(new_entries)):
+            link = get_entry_link(entry)
             try:
                 await publish_entry(bot, feed_url, entry)
                 entry_ts = get_entry_timestamp(entry)
                 if entry_ts is not None:
                     set_last_pub_ts(feed_url, entry_ts)
                 # Clear failure count on successful post
-                FAIL_COUNTS.pop((feed_url, entry.link), None)
+                if link:
+                    FAIL_COUNTS.pop((feed_url, link), None)
             except Exception as e:
                 logging.error(f"Error posting '{entry.title}': {e}")
                 
+                if not link:
+                    continue  # can't track failures without a link, just skip
+                
                 # Track and increment failure attempts for this entry
-                key = (feed_url, entry.link)
+                key = (feed_url, link)
                 fail_count = FAIL_COUNTS.get(key, 0) + 1
                 FAIL_COUNTS[key] = fail_count
                 
                 if fail_count >= MAX_FAIL_ATTEMPTS:
                     logging.error(f"Entry '{entry.title}' failed {fail_count} times. Skipping and marking as seen to unblock queue.")
-                    mark_seen(feed_url, entry.link)
+                    mark_seen(feed_url, link)
                     entry_ts = get_entry_timestamp(entry)
                     if entry_ts is not None:
                         set_last_pub_ts(feed_url, entry_ts)
@@ -345,7 +367,10 @@ async def fetch_and_post_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def fetch_and_post_loop(application: Application):
     while True:
-        await fetch_and_post(application.bot)
+        try:
+            await fetch_and_post(application.bot)
+        except Exception as exc:
+            logging.exception("fetch_and_post_loop: cycle failed, will retry next interval: %s", exc)
         await asyncio.sleep(300)
 
 # ---------------------------------------------------------------------------
@@ -556,8 +581,11 @@ async def seed_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if fallback_count >= MAX_SEEN_PER_FEED:
                 continue
 
-            if not is_seen(feed_url, entry.link):
-                mark_seen(feed_url, entry.link)  # update in-place, no new document
+            link = get_entry_link(entry)
+            if not link:
+                continue  # skip entries without a link
+            if not is_seen(feed_url, link):
+                mark_seen(feed_url, link)
                 total_new += 1
             else:
                 total_skip += 1
